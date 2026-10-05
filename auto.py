@@ -1,83 +1,612 @@
-# Code originally created by maksimKorzh on Github https://github.com/maksimKorzh
-# Code adjusted by Xi-v on Github https://github.com/Xi-v
-#
-# Note from Xi-v:
-# Thank you to the original owner for creating the process, I adjusted it so that it could handle
-# special characters and uppercase, so it would work for all scripts.
-# please enjoy, and don't forget to favourite and watch the repo!
-#
-# There is a way to change the tempo down below, in a variable called delay
+"""
+Roblox Midi AutoPlayer
+Original code by maksimKorzh (https://github.com/maksimKorzh)
+Adjusted by Xi-v (https://github.com/Xi-v)
+Upgraded: MIDI file support, Virtual Piano note mapping, Roblox autofocus,
+and a global Escape hotkey to stop playback at any time.
 
-# packages
+Usage:
+    python auto.py (or double-click the exe)
+                                       -> opens a picker listing the .mid files
+                                          and sheet.txt found in this folder
+    python auto.py song.mid            -> play a MIDI file
+    python auto.py sheet.txt           -> play a Virtual Piano sheet (letters + [chords])
+    python auto.py song.mid --list     -> list the tracks inside a MIDI file
+    python auto.py song.mid --track 2  -> play only track 2
+    python auto.py song.mid --dry-run  -> show what would be played, press no keys
+"""
+
+import os
+import sys
 import time
-from pynput.keyboard import Controller, Key
+import ctypes
+import random
 
-# Initialize the keyboard controller
+from pynput.keyboard import Controller, Key, Listener
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+
+# Base delay between keystrokes for sheet music, in seconds (lower = faster).
+# 0.095 is the classic default.
+DELAY = 0.095
+
+# Count-in before the music starts (the Roblox window is focused automatically).
+START_DELAY = 3.0
+
+# Extra random timing jitter in seconds (0 to disable). Makes playback less robotic.
+HUMANIZE = 0.0
+
+# MIDI notes starting within this many seconds of each other are struck together
+# as one chord. Keep small so fast melody runs are not merged.
+CHORD_THRESHOLD = 0.03
+
+# Small pause between keystrokes so Roblox registers every key.
+KEY_SPACING = 0.012
+
+# Gap inserted before a repeated identical key so both hits are registered.
+SAME_KEY_GAP = 0.02
+
+# Global safety stop: press Escape at any time to abort playback.
+STOP_REQUESTED = False
+DRY_RUN = False
+
+
+def _on_press(key):
+    global STOP_REQUESTED
+    if key == Key.esc:
+        STOP_REQUESTED = True
+
+
+_listener = Listener(on_press=_on_press)
+_listener.daemon = True
+_listener.start()
+
+# ----------------------------------------------------------------------------
+# Virtual Piano layout: one chromatic string spanning C2 (MIDI 36) to C7 (MIDI
+# 96), exactly as virtualpiano.net and Roblox pianos lay it out. The number row
+# starts two octaves below middle C, so middle C (MIDI 60) = 't'. Lowercase =
+# white keys, uppercase letters and shifted symbols = black keys.
+# ----------------------------------------------------------------------------
+VP_LAYOUT = "1!2@34$5%6^78*9(0qQwWeErtTyYuiIoOpPasSdDfgGhHjJklLzZxcCvVbBnm"
+VP_LOWEST = 36   # MIDI note of VP_LAYOUT[0]  (C2, key '1')
+VP_HIGHEST = 96  # MIDI note of VP_LAYOUT[-1] (C7, key 'm')
+
+# Characters that need Shift held down, mapped to the key they sit on.
+# Covers the layout's black-key symbols plus extra symbols seen in hand-made sheets.
+SHIFT_BASE = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
+    "&": "7", "*": "8", "(": "9", ")": "0",
+    "_": "-", "+": "=", "{": "[", "}": "]", ":": ";",
+    '"': "'", "<": ",", ">": ".", "?": "/",
+}
+
+# ----------------------------------------------------------------------------
+# MIDI -> Virtual Piano conversion
+# ----------------------------------------------------------------------------
+
+
+def midi_number_to_vp(midi_number):
+    """Convert a MIDI note number (0-127) to a Virtual Piano key character.
+
+    Notes outside the 61-key layout (C2..C6) are folded in by whole octaves,
+    keeping the pitch class, which is what most MIDI-to-VP converters do.
+    """
+    n = midi_number
+    while n > VP_HIGHEST:
+        n -= 12
+    while n < VP_LOWEST:
+        n += 12
+    return VP_LAYOUT[n - VP_LOWEST]
+
+def load_midi_events(path, track=None):
+    """Parse a MIDI file into absolute-time events.
+
+    Returns a list of (seconds, kind, value):
+      kind 'on'   -> value is a Virtual Piano key char
+      kind 'off'  -> value is the original MIDI note number (release, unused)
+      kind 'meta' -> value is a track name string
+    Tempo changes are honored; channel 10 / drum tracks and notes outside the
+    keyboard range are skipped.
+    """
+    import mido
+
+    mid = mido.MidiFile(path)
+    tpb = mid.ticks_per_beat
+
+    # Tempo is global in a MIDI file, so collect tempo changes from ALL tracks.
+    tempo_map = [(0, 500000)]  # (tick, microseconds per beat) - default 120 BPM
+    notes = []                 # (tick, kind, midi note number)
+    names = {}                 # track index -> name
+    for i, tr in enumerate(mid.tracks):
+        if tr.name and tr.name.strip():
+            names[i] = tr.name.strip()
+        tick = 0
+        for msg in tr:
+            tick += msg.time
+            if msg.type == "set_tempo":
+                tempo_map.append((tick, msg.tempo))
+            elif track is None or i == track:
+                if msg.type == "note_on" and msg.velocity > 0:
+                    notes.append((tick, "on", msg.note))
+                elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                    notes.append((tick, "off", msg.note))
+
+    tempo_map.sort(key=lambda x: x[0])
+
+    def tick_to_seconds(tick):
+        seconds = 0.0
+        prev_tick, prev_tempo = tempo_map[0]
+        for t, tempo in tempo_map[1:]:
+            if t >= tick:
+                break
+            seconds += (t - prev_tick) * prev_tempo / 1e6 / tpb
+            prev_tick, prev_tempo = t, tempo
+        seconds += (tick - prev_tick) * prev_tempo / 1e6 / tpb
+        return seconds
+
+    events = [(0.0, "meta", f"track {i}: {name}") for i, name in sorted(names.items())]
+    for tick, kind, note in notes:
+        t = tick_to_seconds(tick)
+        if kind == "on":
+            char = midi_number_to_vp(note)
+            if char:
+                events.append((t, "on", char))
+        else:
+            events.append((t, "off", note))
+
+    events.sort(key=lambda e: e[0])
+    return events
+
+
+def events_to_steps(events, chord_threshold=CHORD_THRESHOLD):
+    """Collapse timed events into playable steps of [time, [key chars]].
+
+    Notes starting within chord_threshold seconds of the step's first note are
+    struck together as a chord; duplicate keys inside one chord are kept once.
+    Meta and release events are dropped.
+    """
+    steps = []
+    for t, kind, value in events:
+        if kind != "on":
+            continue
+        if steps and t - steps[-1][0] <= chord_threshold and value not in steps[-1][1]:
+            steps[-1][1].append(value)
+        else:
+            steps.append([t, [value]])
+    return steps
+
+
+def steps_to_sequence(steps):
+    """Convert steps into a play list of (delay_before, [chars]) tuples."""
+    seq = []
+    for i, (t, chars) in enumerate(steps):
+        delay = t - steps[i - 1][0] if i else t
+        seq.append((delay, chars))
+    return seq
+
+
+# ----------------------------------------------------------------------------
+# Playback
+# ----------------------------------------------------------------------------
+
 keyboard = Controller()
 
 
-print("Quickly head over to your desired choice of playing")
-print('Music will start playing in 2 seconds...')
-time.sleep(2)
+def press_vp_key(char):
+    """Press a single Virtual Piano key, holding Shift for black keys."""
+    if DRY_RUN:
+        return
+    if char in SHIFT_BASE:
+        base = SHIFT_BASE[char]
+        with keyboard.pressed(Key.shift):
+            keyboard.press(base)
+            keyboard.release(base)
+    elif char.isupper():
+        with keyboard.pressed(Key.shift):
+            keyboard.press(char.lower())
+            keyboard.release(char.lower())
+    else:
+        keyboard.press(char)
+        keyboard.release(char)
 
-# Change the temp here (in seconds 1 = 1 second, 0.5 = Half a second)
-# 0.095 is default best sound by far
-# 0.095 for Stay with me
-# 0.12 for Fallen Down
-# 0.09 for Ao No Sumika
-# 0.095 for Shinunoga E wa
-# 0.115 for Believer
-# 0.095 for Golden hour
 
-delay = 0.095
+def _interruptible_sleep(duration):
+    """Sleep for `duration` seconds, returning early (False) if Escape is pressed."""
+    end = time.perf_counter() + duration
+    while True:
+        remaining = end - time.perf_counter()
+        if remaining <= 0:
+            return True
+        if STOP_REQUESTED:
+            return False
+        time.sleep(min(0.05, remaining))
 
-# Mapping for special characters that require Shift
-special_characters = {
-    '!': '1', '@': '2', '#': '3', '$': '4', '%': '5',
-    '^': '6', '&': '7', '*': '8', '(': '9', ')': '0',
-    '_': '-', '+': '=', '{': '[', '}': ']', ':': ';',
-    '"': "'", '<': ',', '>': '.', '?': '/'
-}
 
-def press_key(note):
-    if note in special_characters:  
-        keyboard.press(Key.shift)
-        keyboard.press(special_characters[note])
-        keyboard.release(special_characters[note])
-        keyboard.release(Key.shift)
-    elif note.isupper():
-        keyboard.press(Key.shift)
-        keyboard.press(note.lower())
-        keyboard.release(note.lower())
-        keyboard.release(Key.shift)
-    else: 
-        keyboard.press(note)
-        keyboard.release(note)
+def play_sequence(seq, label="", char_spacing=KEY_SPACING, step_gap=0.0):
+    """Play a sequence of (delay, [chars]) steps with Escape-to-stop support.
 
-with open('sheet.txt') as f:
-    notes = f.read()
+    delay waits before the step, chars are pressed char_spacing apart,
+    and step_gap is added after every step.
+    """
+    # Disarm the ESC hotkey when playback starts: keys typed while filling in
+    # the picker (e.g. Escape in the paste box) must not abort a fresh song.
+    global STOP_REQUESTED
+    STOP_REQUESTED = False
+    keys = sum(len(c) for _, c in seq)
+    est = sum(d for d, _ in seq) + keys * char_spacing + len(seq) * step_gap
+    if DRY_RUN:
+        # Show the sequence instantly instead of playing it in real time.
+        char_spacing = step_gap = 0.0
+        delay_scale = 0.0
+    else:
+        delay_scale = 1.0
+    print(f"\nPlaying {label}: {len(seq)} steps, {keys} keys, ~{est:.0f}s.")
+    print("The Roblox window will be focused automatically. Press ESC to stop.\n")
+
+    for remaining in range(int(START_DELAY), 0, -1):
+        print(f"  starting in {remaining}...", end="\r", flush=True)
+        if not _interruptible_sleep(1.0):
+            print("\n[Stopped before start]          ")
+            return False
+    print(" " * 30, end="\r")
+
+    last_char = None
+    for delay, chars in seq:
+        wait = (delay + (random.uniform(0, HUMANIZE) if HUMANIZE else 0.0)) * delay_scale
+        if wait > 0 and not _interruptible_sleep(wait):
+            print("\n[Stopped by user]")
+            return False
+        for c in chars:
+            if STOP_REQUESTED:
+                print("\n[Stopped by user]")
+                return False
+            if c == last_char and SAME_KEY_GAP:
+                time.sleep(SAME_KEY_GAP)
+            press_vp_key(c)
+            last_char = c
+            if not DRY_RUN:
+                print(f"  {c}")
+            time.sleep(char_spacing)
+        time.sleep(step_gap)
+    print("\n[Finished]")
+    return True
+
+
+# ----------------------------------------------------------------------------
+# Sheet music (.txt) playback - original Virtual Piano sheet format
+# ----------------------------------------------------------------------------
+
+
+def parse_sheet_text(notes):
+    """Parse Virtual Piano sheet text into a (delay, [chars]) step list.
+    Chords [abc] are struck together, '|' rests DELAY*8, other characters
+    (spaces/newlines) rest one DELAY - matching the original script."""
+
+    # Delays land after each step (step_gap=DELAY below), matching the original
+    # script: note chars follow one another every DELAY, chords are instant.
+    seq = []
     index = 0
-
-    while index in range(len(notes)):
-        if notes[index].isalnum() or notes[index] in special_characters:
-            press_key(notes[index])
-            print("pressed key:", notes[index])
-
+    while index < len(notes):
+        ch = notes[index]
+        if ch.isalnum() or ch in SHIFT_BASE:
+            seq.append((0.0, [ch]))
+            index += 1
+        elif ch == "|":
+            seq.append((DELAY * 8, []))
+            index += 1
+        elif ch == "[":
+            index += 1
+            chord = []
+            while index < len(notes) and notes[index] != "]":
+                if notes[index].isalnum() or notes[index] in SHIFT_BASE:
+                    chord.append(notes[index])
+                index += 1
+            index += 1  # skip ']'
+            seq.append((0.0, chord))
         else:
-            if notes[index] == '|': 
-                time.sleep(delay * 8)
+            # spaces, newlines etc. rest one beat, like the original script
+            seq.append((0.0, []))
+            index += 1
+    return seq
 
-            if notes[index] == '[':
-                chord = []
-                while notes[index] != ']':
-                    if notes[index].isalnum() or notes[index] in special_characters:
-                        chord.append(notes[index])
-                    index += 1
 
-                for note in chord:
-                    press_key(note)
+def play_sheet(path=None, text=None):
+    """Play a Virtual Piano sheet from a file path or a raw text string."""
+    if text is None:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    seq = parse_sheet_text(text)
+    return play_sequence(seq, label=path or "pasted sheet",
+                         char_spacing=KEY_SPACING, step_gap=DELAY)
 
-                print("pressed keys:", chord)
 
-        time.sleep(delay)
-        index += 1        
+# ----------------------------------------------------------------------------
+# Roblox window focus (Windows)
+# ----------------------------------------------------------------------------
+
+
+def focus_roblox():
+    """Bring the Roblox window to the foreground. Returns True on success."""
+    try:
+        user32 = ctypes.windll.user32
+        FindWindowW = user32.FindWindowW
+        FindWindowW.restype = ctypes.c_void_p
+        FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        SetForegroundWindow = user32.SetForegroundWindow
+        SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        keybd_event = user32.keybd_event
+
+        hwnd = FindWindowW("RobloxWindow", None)
+
+        if not hwnd:
+            # Fallback: any top-level window with "roblox" in its title.
+            result = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+            def enum_callback(h, _):
+                length = user32.GetWindowTextLengthW(h)
+                if length:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(h, buf, length + 1)
+                    if "roblox" in buf.value.lower():
+                        result.append(h)
+                return True
+
+            user32.EnumWindows(enum_callback, None)
+            hwnd = result[0] if result else None
+
+        if not hwnd:
+            print("Could not find a Roblox window - switch to it manually now!")
+            return False
+
+        # Windows blocks focus stealing; a benign Alt tap unlocks SetForegroundWindow.
+        keybd_event(0xA4, 0, 0, 0)  # Alt down
+        keybd_event(0xA4, 0, 2, 0)  # Alt up (KEYEVENTF_KEYUP)
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE (un-minimize if needed)
+        SetForegroundWindow(hwnd)
+        time.sleep(0.3)
+        print("Focused the Roblox window.")
+        return True
+    except Exception as exc:
+        print(f"Could not focus Roblox ({exc}); switch windows manually now!")
+        return False
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+
+def app_dir():
+    """Folder containing the script (or the frozen .exe itself)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def build_choices():
+    """List playable files next to the app: [(path, label, is_default)].
+
+    MIDIs come first, sheet.txt last; the first entry is the default.
+    """
+    base = app_dir()
+    choices = []
+    for f in sorted(f for f in os.listdir(base) if f.lower().endswith((".mid", ".midi"))):
+        full = os.path.join(base, f)
+        size_kb = os.path.getsize(full) // 1024
+        choices.append((full, f"{f}  ({size_kb} KB)", False))
+    sheet = os.path.join(base, "sheet.txt")
+    if os.path.isfile(sheet):
+        choices.append((sheet, "sheet.txt  (Virtual Piano sheet)", False))
+    if choices:
+        choices[0] = (choices[0][0], choices[0][1], True)
+    return choices
+
+
+def choose_with_ui():
+    """Open a small picker window with two tabs:
+      - 'Files in this folder': every .mid/.midi plus sheet.txt
+      - 'Paste a sheet': type/paste Virtual Piano sheet text and play it
+    Returns ('file', path), ('text', sheet_content), or None if canceled."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    choices = build_choices()
+    root = tk.Tk()
+    root.title("Roblox Midi AutoPlayer")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)  # stay visible over Roblox while picking
+
+    chosen = [None]
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=8, pady=8)
+
+    # --- Tab 1: files in this folder -------------------------------------
+    files_tab = ttk.Frame(notebook)
+    notebook.add(files_tab, text="Files in this folder")
+
+    tk.Label(files_tab, text="What should I play?",
+             font=("Segoe UI", 11, "bold")).pack(padx=12, pady=(10, 4))
+
+    if choices:
+        listbox = tk.Listbox(files_tab, width=48, height=min(len(choices), 10),
+                             activestyle="dotbox", exportselection=False)
+        for _, label, _default in choices:
+            listbox.insert(tk.END, label)
+        listbox.selection_set(0)
+        listbox.pack(padx=12, pady=6)
+
+        tk.Label(files_tab, text="Roblox will be focused automatically.",
+                 fg="#555").pack(padx=12, pady=(0, 6))
+
+        def start(_event=None):
+            sel = listbox.curselection()
+            if sel:
+                chosen[0] = ("file", choices[sel[0]][0])
+            root.destroy()
+
+        listbox.bind("<Double-Button-1>", start)
+        listbox.focus_set()
+
+        btns = tk.Frame(files_tab)
+        btns.pack(pady=(0, 10))
+        tk.Button(btns, text="Start", width=12, command=start).pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="Quit", width=12, command=root.destroy).pack(side=tk.LEFT, padx=4)
+    else:
+        tk.Label(files_tab, text="No .mid files or sheet.txt found in this folder.\n"
+                            "Drop a MIDI file next to this program, or use the\n"
+                            "'Paste a sheet' tab to play something right now.",
+                 justify="center").pack(padx=24, pady=16)
+        tk.Button(files_tab, text="Quit", width=12,
+                  command=root.destroy).pack(pady=(0, 10))
+
+    # --- Tab 2: paste your own sheet -------------------------------------
+    paste_tab = ttk.Frame(notebook)
+    notebook.add(paste_tab, text="Paste a sheet")
+
+    tk.Label(paste_tab, text="Paste or type a Virtual Piano sheet:",
+             font=("Segoe UI", 11, "bold")).pack(padx=12, pady=(10, 2))
+    tk.Label(paste_tab, text="lowercase = white keys, UPPERCASE & !@$%^*() = black keys, "
+                             "[abc] = chord, | = pause", fg="#555").pack(padx=12, pady=(0, 4))
+
+    paste_hint = tk.Label(paste_tab, text="", fg="#b00020")
+    sheet_box = tk.Text(paste_tab, width=56, height=12, wrap="word", undo=True)
+    sheet_box.pack(padx=12, pady=2)
+
+    def play_pasted(_event=None):
+        content = sheet_box.get("1.0", "end").strip()
+        if not content:
+            paste_hint.config(text="Paste a sheet first!")
+            return
+        chosen[0] = ("text", content)
+        root.destroy()
+
+    pbtns = tk.Frame(paste_tab)
+    pbtns.pack(pady=8)
+    tk.Button(pbtns, text="Play pasted sheet", width=16,
+              command=play_pasted).pack(side=tk.LEFT, padx=4)
+    tk.Button(pbtns, text="Clear", width=10,
+              command=lambda: (sheet_box.delete("1.0", "end"),
+                               paste_hint.config(text=""))).pack(side=tk.LEFT, padx=4)
+    paste_hint.pack()
+
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.mainloop()
+    return chosen[0]
+
+
+def pick_file():
+    """Auto-detect what to play: the first .mid/.midi next to the app, else sheet.txt."""
+    base = app_dir()  # scan the exe's own folder so double-clicking it just works
+    mids = sorted(f for f in os.listdir(base) if f.lower().endswith((".mid", ".midi")))
+    if mids and os.path.isfile(os.path.join(base, "sheet.txt")):
+        print(f"Found both sheet.txt and {mids[0]}; using {mids[0]}.")
+        print("(Run 'python auto.py sheet.txt' to force the sheet instead.)")
+    if mids:
+        return os.path.join(base, mids[0])
+    sheet = os.path.join(base, "sheet.txt")
+    return sheet if os.path.isfile(sheet) else None
+
+
+def main():
+    global DRY_RUN
+
+    args = sys.argv[1:]
+    track = None
+    if "--track" in args:
+        i = args.index("--track")
+        if i + 1 < len(args):
+            track = int(args[i + 1])
+            del args[i:i + 2]
+    list_tracks = "--list" in args
+    if list_tracks:
+        args.remove("--list")
+    if "--dry-run" in args:
+        args.remove("--dry-run")
+        DRY_RUN = True
+        print("[Dry run: no keys will be pressed]")
+
+    path = args[0] if args else None
+    if path is None and not list_tracks and not DRY_RUN:
+        # Plain launch (or double-click): open the file picker UI.
+        try:
+            picked = choose_with_ui()
+        except Exception as exc:
+            print(f"Could not open the picker UI ({exc}); falling back to auto-detect.")
+            picked = pick_file()
+        if picked is None:
+            print("Nothing selected.")
+            return 0
+        kind, value = picked
+        try:
+            if not DRY_RUN:
+                focus_roblox()
+            if kind == "file":
+                path = value
+            else:
+                return 0 if play_sheet(text=value) else 1
+        except KeyboardInterrupt:
+            print("\n[Stopped by user]")
+            return 0
+    elif path is None:
+        path = pick_file()
+
+    if path is None:
+        print("No .mid or sheet.txt found. Drop a MIDI file next to auto.py or run:")
+        print("    python auto.py path\\to\\song.mid")
+        return 1
+    if not os.path.isfile(path):
+        print(f"File not found: {path}")
+        return 1
+
+    print(f"Selected: {path}")
+
+    if path.lower().endswith((".mid", ".midi")):
+        try:
+            events = load_midi_events(path, track=track)
+        except ImportError:
+            print("Missing dependency 'mido'. Install it with:  pip install mido")
+            return 1
+        metas = [v for _, k, v in events if k == "meta"]
+        note_count = sum(1 for _, k, _ in events if k == "on")
+        if list_tracks:
+            print("Tracks in this MIDI file (drum tracks are skipped automatically):")
+            for m in metas:
+                print(f"  {m}")
+            return 0
+        if note_count == 0:
+            print("No playable notes found (try --list to inspect tracks).")
+            return 1
+        for m in metas:
+            print(f"  {m}")
+        print(f"  {note_count} playable notes")
+
+        try:
+            seq = steps_to_sequence(events_to_steps(events))
+            if not DRY_RUN:
+                focus_roblox()
+            play_sequence(seq, label=path)
+        except KeyboardInterrupt:
+            print("\n[Stopped by user]")
+    else:
+        try:
+            if not DRY_RUN:
+                focus_roblox()
+            play_sheet(path)
+        except KeyboardInterrupt:
+            print("\n[Stopped by user]")
+    return 0
+
+
+if __name__ == "__main__":
+    _code = main()
+    if _code and getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
+        # Keep a double-clicked exe's console open so the error can be read.
+        try:
+            input("\nPress Enter to close...")
+        except EOFError:
+            pass
+    sys.exit(_code)
