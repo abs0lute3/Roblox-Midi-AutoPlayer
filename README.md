@@ -23,6 +23,10 @@ window opens with two tabs:
 - **Paste a sheet** - paste or type any Virtual Piano sheet
   (lowercase = white keys, UPPERCASE & `!@$%^*()` = black keys, `[abc]` = chord,
   `|` = pause) and hit **Play pasted sheet**.
+- **Turn off keyboard while playing** - a checkbox at the bottom of the picker,
+  on by default. While a song plays your physical keyboard is turned off so
+  typing can't clash with the song; the player's own keys still reach Roblox.
+  Uncheck it (or run with `--allow-keyboard`) to keep your keyboard live.
 
 Or from the command line:
 
@@ -33,10 +37,12 @@ python auto.py sheet.txt          # play a Virtual Piano sheet (no UI)
 python auto.py song.mid --list    # show the tracks inside a MIDI file
 python auto.py song.mid --track 2 # play only track 2
 python auto.py song.mid --dry-run # show what would be played, press no keys
+python auto.py --allow-keyboard   # keep your keyboard on while playing
 ```
 
 A 3-second count-in starts after the Roblox window is focused.
-**Press ESC at any time to stop.**
+**Press ESC at any time to stop.** Press **Ctrl+E** any time to hide or show
+the command window.
 
 ## How it works
 
@@ -63,6 +69,7 @@ Open `auto.py` and edit the config block at the top:
 | `KEY_SPACING`     | `0.012` | Pause between individual keystrokes             |
 | `SAME_KEY_GAP`    | `0.02`  | Extra gap when the same key repeats             |
 | `HUMANIZE`        | `0.0`   | Random timing jitter for a less robotic sound   |
+| `BLOCK_KEYBOARD`  | `True`  | Turn off your keyboard while a song plays       |
 
 For MIDI playback the timing comes from the file itself, so `DELAY` mostly affects
 sheets; `KEY_SPACING` and `CHORD_THRESHOLD` shape how MIDI songs sound.
@@ -74,6 +81,8 @@ sheets; `KEY_SPACING` and `CHORD_THRESHOLD` shape how MIDI songs sound.
 - If a MIDI sounds muddy, play only the melody: `python auto.py song.mid --list`,
   then `--track N` on the melodic track.
 - Antivirus software may flag synthetic keystrokes - that's a false positive.
+- **Ctrl+E** hides or shows the command window at any time, even while playing.
+  While the keyboard is turned off, ESC and Ctrl+E keep working.
 
 ## Rebuilding the EXE
 

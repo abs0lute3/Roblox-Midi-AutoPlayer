@@ -3,7 +3,9 @@ Roblox Midi AutoPlayer
 Original code by maksimKorzh (https://github.com/maksimKorzh)
 Adjusted by Xi-v (https://github.com/Xi-v)
 Upgraded: MIDI file support, Virtual Piano note mapping, Roblox autofocus,
-and a global Escape hotkey to stop playback at any time.
+a global Escape hotkey to stop playback at any time, an option to turn the
+keyboard off while a song plays (on by default), and Ctrl+E to hide or show
+the command window.
 
 Usage:
     python auto.py (or double-click the exe)
@@ -14,6 +16,9 @@ Usage:
     python auto.py song.mid --list     -> list the tracks inside a MIDI file
     python auto.py song.mid --track 2  -> play only track 2
     python auto.py song.mid --dry-run  -> show what would be played, press no keys
+    python auto.py --allow-keyboard    -> keep your keyboard on while playing
+
+    Ctrl+E (any time)                  -> hide or show the command window
 """
 
 import os
@@ -21,6 +26,7 @@ import sys
 import time
 import ctypes
 import random
+import threading
 
 from pynput.keyboard import Controller, Key, Listener
 
@@ -47,6 +53,12 @@ KEY_SPACING = 0.012
 
 # Gap inserted before a repeated identical key so both hits are registered.
 SAME_KEY_GAP = 0.02
+
+# While a song plays, turn off the physical keyboard so typing can't clash
+# with the automatic keys. The player's own synthetic keystrokes still reach
+# Roblox, ESC still stops playback, and the keyboard comes back afterwards.
+# On by default; uncheck it in the picker or run with --allow-keyboard.
+BLOCK_KEYBOARD = True
 
 # Global safety stop: press Escape at any time to abort playback.
 STOP_REQUESTED = False
@@ -225,6 +237,22 @@ def _interruptible_sleep(duration):
 
 
 def play_sequence(seq, label="", char_spacing=KEY_SPACING, step_gap=0.0):
+    """Play a song, honoring the keyboard-off setting."""
+    blocker = None
+    if BLOCK_KEYBOARD and not DRY_RUN and os.name == "nt":
+        blocker = KeyboardBlocker()
+        if blocker.start():
+            print("[Keyboard off while playing - ESC still stops, Ctrl+E still works]")
+        else:
+            blocker = None
+    try:
+        return _play_sequence_inner(seq, label, char_spacing, step_gap)
+    finally:
+        if blocker:
+            blocker.stop()
+
+
+def _play_sequence_inner(seq, label="", char_spacing=KEY_SPACING, step_gap=0.0):
     """Play a sequence of (delay, [chars]) steps with Escape-to-stop support.
 
     delay waits before the step, chars are pressed char_spacing apart,
@@ -375,6 +403,136 @@ def focus_roblox():
 
 
 # ----------------------------------------------------------------------------
+# Keyboard & console controls (Windows)
+#   - Ctrl+E hides or shows the command window, any time the app is running.
+#   - While a song plays the physical keyboard can be turned off: a low-level
+#     hook swallows real keystrokes but lets the player's own synthetic keys
+#     through, ESC still stops playback, and the keyboard returns as soon as
+#     the song ends or is stopped.
+# ----------------------------------------------------------------------------
+
+
+def toggle_console_window():
+    """Hide or show the command window. No-op when there is no console."""
+    if os.name != "nt":
+        return
+    hwnd = _kernel32.GetConsoleWindow()
+    if not hwnd:
+        return
+    if _user32.IsWindowVisible(hwnd):
+        print("[Command window hidden - press Ctrl+E to bring it back]")
+        _user32.ShowWindow(hwnd, _SW_HIDE)
+    else:
+        _user32.ShowWindow(hwnd, _SW_SHOW)
+
+
+def start_console_hotkey():
+    """Listen for Ctrl+E while the keyboard is not turned off."""
+    try:
+        from pynput.keyboard import GlobalHotKeys
+
+        hotkeys = GlobalHotKeys({"<ctrl>+e": toggle_console_window})
+        hotkeys.daemon = True
+        hotkeys.start()
+    except Exception:
+        pass  # the hotkey is a convenience, never fatal
+
+
+if os.name == "nt":
+    import ctypes.wintypes as _wt
+
+    _WH_KEYBOARD_LL = 13        # low-level keyboard hook
+    _LLKHF_INJECTED = 0x10      # event was sent by software, not a real key
+    _VK_ESCAPE, _VK_CONTROL, _VK_E = 0x1B, 0x11, 0x45
+    _WM_QUIT = 0x0012
+    _SW_HIDE, _SW_SHOW = 0, 5
+
+    _LRESULT = ctypes.c_ssize_t
+    _HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, _wt.WPARAM, _wt.LPARAM)
+
+    class _KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", _wt.DWORD),
+            ("scanCode", _wt.DWORD),
+            ("flags", _wt.DWORD),
+            ("time", _wt.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+    _kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+    _user32.SetWindowsHookExW.restype = ctypes.c_void_p
+    _user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, _HOOKPROC, _wt.HINSTANCE, _wt.DWORD]
+    _user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+    _user32.PostThreadMessageW.argtypes = [
+        _wt.DWORD, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
+    _user32.CallNextHookEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, _wt.WPARAM, _wt.LPARAM]
+    _user32.CallNextHookEx.restype = _LRESULT
+
+
+class KeyboardBlocker:
+    """Turn the physical keyboard off while a song plays (Windows)."""
+
+    def __init__(self):
+        self._hook = None
+        self._proc = None
+        self._thread = None
+        self._thread_id = 0
+        self._quit = threading.Event()
+
+    def start(self):
+        ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(ready,), daemon=True)
+        self._thread.start()
+        if not ready.wait(3.0):
+            print("[!] Could not turn the keyboard off; playing without it.")
+            self.stop()
+            return False
+        return True
+
+    def _run(self, ready):
+        self._thread_id = _kernel32.GetCurrentThreadId()
+
+        def hook_proc(n_code, w_param, l_param):
+            global STOP_REQUESTED
+            if n_code == 0:
+                kb = ctypes.cast(l_param, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                if kb.vkCode == _VK_ESCAPE:
+                    STOP_REQUESTED = True
+                    try:
+                        self.stop()
+                    except Exception:
+                        pass
+                    return 1
+                if kb.vkCode == _VK_E and _user32.GetAsyncKeyState(_VK_CONTROL) & 0x8000:
+                    toggle_console_window()
+                    return 1
+                if not (kb.flags & _LLKHF_INJECTED):
+                    return 1
+            return _user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+        self._proc = _HOOKPROC(hook_proc)
+        self._hook = _user32.SetWindowsHookExW(_WH_KEYBOARD_LL, self._proc, None, 0)
+        ready.set()
+        if not self._hook:
+            print("[!] Could not turn the keyboard off; playing without it.")
+            return
+        msg = _wt.MSG()
+        while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0 and not self._quit.is_set():
+            pass
+        _user32.UnhookWindowsHookEx(self._hook)
+        self._hook = None
+
+    def stop(self):
+        self._quit.set()
+        if self._thread_id:
+            _user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -409,7 +567,8 @@ def choose_with_ui():
     """Open a small picker window with two tabs:
       - 'Files in this folder': every .mid/.midi plus sheet.txt
       - 'Paste a sheet': type/paste Virtual Piano sheet text and play it
-    Returns ('file', path), ('text', sheet_content), or None if canceled."""
+    Returns ('file', path, keyboard_off), ('text', text, keyboard_off),
+    or None if canceled."""
     import tkinter as tk
     from tkinter import ttk
 
@@ -423,6 +582,14 @@ def choose_with_ui():
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True, padx=8, pady=8)
+
+    block_var = tk.BooleanVar(value=BLOCK_KEYBOARD)
+    options = tk.Frame(root)
+    options.pack(fill="x", padx=8)
+    tk.Checkbutton(options, text="Turn off keyboard while playing",
+                   variable=block_var).pack(side=tk.LEFT)
+    tk.Label(options, text="Ctrl+E hides/shows the command window",
+             fg="#555").pack(side=tk.RIGHT)
 
     # --- Tab 1: files in this folder -------------------------------------
     files_tab = ttk.Frame(notebook)
@@ -445,7 +612,7 @@ def choose_with_ui():
         def start(_event=None):
             sel = listbox.curselection()
             if sel:
-                chosen[0] = ("file", choices[sel[0]][0])
+                chosen[0] = ("file", choices[sel[0]][0], bool(block_var.get()))
             root.destroy()
 
         listbox.bind("<Double-Button-1>", start)
@@ -481,7 +648,7 @@ def choose_with_ui():
         if not content:
             paste_hint.config(text="Paste a sheet first!")
             return
-        chosen[0] = ("text", content)
+        chosen[0] = ("text", content, bool(block_var.get()))
         root.destroy()
 
     pbtns = tk.Frame(paste_tab)
@@ -512,7 +679,7 @@ def pick_file():
 
 
 def main():
-    global DRY_RUN
+    global DRY_RUN, BLOCK_KEYBOARD
 
     args = sys.argv[1:]
     track = None
@@ -524,6 +691,10 @@ def main():
     list_tracks = "--list" in args
     if list_tracks:
         args.remove("--list")
+    if "--allow-keyboard" in args:
+        args.remove("--allow-keyboard")
+        BLOCK_KEYBOARD = False
+        print("[Keyboard stays on while playing]")
     if "--dry-run" in args:
         args.remove("--dry-run")
         DRY_RUN = True
@@ -532,6 +703,8 @@ def main():
     path = args[0] if args else None
     if path is None and not list_tracks and not DRY_RUN:
         # Plain launch (or double-click): open the file picker UI.
+        start_console_hotkey()
+        print("Tip: press Ctrl+E to hide or show this command window.")
         try:
             picked = choose_with_ui()
         except Exception as exc:
@@ -540,7 +713,10 @@ def main():
         if picked is None:
             print("Nothing selected.")
             return 0
-        kind, value = picked
+        if isinstance(picked, str):  # auto-detect fallback returned a path
+            picked = ("file", picked, True)
+        kind, value, block_kb = picked
+        BLOCK_KEYBOARD = bool(block_kb)
         try:
             if not DRY_RUN:
                 focus_roblox()
