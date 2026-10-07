@@ -27,6 +27,12 @@ window opens with two tabs:
   on by default. While a song plays your physical keyboard is turned off so
   typing can't clash with the song; the player's own keys still reach Roblox.
   Uncheck it (or run with `--allow-keyboard`) to keep your keyboard live.
+- **Speed** - a slider under the song list, at 1.00x by default: how fast the
+  song is played (2.00x = twice as fast, 0.50x = half speed).
+- **Mistakes** - Beginner / Legit / Pro, usually on Legit. Every few keys the
+  player "slips" and hits the key right next to the intended one (meant E,
+  played R), like real human error: Beginner every 12 keys, Legit every 24
+  (default), Pro every 45.
 
 Or from the command line:
 
@@ -41,8 +47,8 @@ python auto.py --allow-keyboard   # keep your keyboard on while playing
 ```
 
 A 3-second count-in starts after the Roblox window is focused.
-**Press ESC at any time to stop.** Press **Ctrl+E** any time to hide or show
-the command window.
+**Press ESC at any time to stop.** Press **Ctrl+E** any time to close the
+command window.
 
 ## How it works
 
@@ -70,6 +76,8 @@ Open `auto.py` and edit the config block at the top:
 | `SAME_KEY_GAP`    | `0.02`  | Extra gap when the same key repeats             |
 | `HUMANIZE`        | `0.0`   | Random timing jitter for a less robotic sound   |
 | `BLOCK_KEYBOARD`  | `True`  | Turn off your keyboard while a song plays       |
+| `SPEED`           | `1.0`   | Playback speed multiplier (set by the slider)   |
+| `MISTAKE_EVERY`   | `24`    | Keys between human-error slips (Legit)          |
 
 For MIDI playback the timing comes from the file itself, so `DELAY` mostly affects
 sheets; `KEY_SPACING` and `CHORD_THRESHOLD` shape how MIDI songs sound.
@@ -81,8 +89,8 @@ sheets; `KEY_SPACING` and `CHORD_THRESHOLD` shape how MIDI songs sound.
 - If a MIDI sounds muddy, play only the melody: `python auto.py song.mid --list`,
   then `--track N` on the melodic track.
 - Antivirus software may flag synthetic keystrokes - that's a false positive.
-- **Ctrl+E** hides or shows the command window at any time, even while playing.
-  While the keyboard is turned off, ESC and Ctrl+E keep working.
+- **Ctrl+E** closes the command window at any time, even while playing. While
+  the keyboard is turned off, ESC and Ctrl+E keep working.
 
 ## Rebuilding the EXE
 

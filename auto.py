@@ -4,7 +4,7 @@ Original code by maksimKorzh (https://github.com/maksimKorzh)
 Adjusted by Xi-v (https://github.com/Xi-v)
 Upgraded: MIDI file support, Virtual Piano note mapping, Roblox autofocus,
 a global Escape hotkey to stop playback at any time, an option to turn the
-keyboard off while a song plays (on by default), and Ctrl+E to hide or show
+keyboard off while a song plays (on by default), and Ctrl+E to close
 the command window.
 
 Usage:
@@ -18,7 +18,7 @@ Usage:
     python auto.py song.mid --dry-run  -> show what would be played, press no keys
     python auto.py --allow-keyboard    -> keep your keyboard on while playing
 
-    Ctrl+E (any time)                  -> hide or show the command window
+    Ctrl+E (any time)                  -> close the command window for good
 """
 
 import os
@@ -59,6 +59,18 @@ SAME_KEY_GAP = 0.02
 # Roblox, ESC still stops playback, and the keyboard comes back afterwards.
 # On by default; uncheck it in the picker or run with --allow-keyboard.
 BLOCK_KEYBOARD = True
+
+# Playback speed multiplier (1.0 = normal). The picker's Speed slider sets
+# this: 2.0 plays twice as fast, 0.5 at half speed.
+SPEED = 1.0
+
+# Human-error slips: every N key presses, hit the key one over instead (like
+# meaning E but hitting R), so playback sounds like a real person. The
+# picker's Mistakes box chooses it: Beginner = every 12 keys, Legit = every
+# 24 (default), Pro = every 45.
+MISTAKE_MODE = "Legit"
+MISTAKE_MAP = {"Beginner": 12, "Legit": 24, "Pro": 45}
+MISTAKE_EVERY = MISTAKE_MAP[MISTAKE_MODE]
 
 # Global safety stop: press Escape at any time to abort playback.
 STOP_REQUESTED = False
@@ -224,6 +236,22 @@ def press_vp_key(char):
         keyboard.release(char)
 
 
+# Keyboard rows used for human-error slips: the neighbor of a key is the key
+# right next to it on the same row (E slips to R, per the Mistakes setting).
+_QWERTY_ROWS = ("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm")
+
+
+def _neighbor_key(char):
+    """The key right next to `char` on the keyboard (one key over)."""
+    base = SHIFT_BASE.get(char, char.lower())
+    for row in _QWERTY_ROWS:
+        if base in row:
+            i = row.index(base)
+            nxt = row[i + 1] if i + 1 < len(row) else row[i - 1]
+            return nxt.upper() if char.isupper() else nxt
+    return char
+
+
 def _interruptible_sleep(duration):
     """Sleep for `duration` seconds, returning early (False) if Escape is pressed."""
     end = time.perf_counter() + duration
@@ -237,7 +265,11 @@ def _interruptible_sleep(duration):
 
 
 def play_sequence(seq, label="", char_spacing=KEY_SPACING, step_gap=0.0):
-    """Play a song, honoring the keyboard-off setting."""
+    """Play a song, honoring the speed, keyboard-off and slip settings."""
+    if SPEED != 1.0:
+        seq = [(d / SPEED, chars) for d, chars in seq]
+        char_spacing = char_spacing / SPEED
+        step_gap = step_gap / SPEED
     blocker = None
     if BLOCK_KEYBOARD and not DRY_RUN and os.name == "nt":
         blocker = KeyboardBlocker()
@@ -281,6 +313,7 @@ def _play_sequence_inner(seq, label="", char_spacing=KEY_SPACING, step_gap=0.0):
     print(" " * 30, end="\r")
 
     last_char = None
+    key_count = 0
     for delay, chars in seq:
         wait = (delay + (random.uniform(0, HUMANIZE) if HUMANIZE else 0.0)) * delay_scale
         if wait > 0 and not _interruptible_sleep(wait):
@@ -290,12 +323,17 @@ def _play_sequence_inner(seq, label="", char_spacing=KEY_SPACING, step_gap=0.0):
             if STOP_REQUESTED:
                 print("\n[Stopped by user]")
                 return False
+            key_count += 1
+            play_char = c
+            if MISTAKE_EVERY and key_count % MISTAKE_EVERY == 0:
+                # Human-error slip: hit the key one over by mistake.
+                play_char = _neighbor_key(c)
             if c == last_char and SAME_KEY_GAP:
-                time.sleep(SAME_KEY_GAP)
-            press_vp_key(c)
-            last_char = c
+                time.sleep(SAME_KEY_GAP / SPEED)
+            press_vp_key(play_char)
+            last_char = play_char
             if not DRY_RUN:
-                print(f"  {c}")
+                print(f"  {play_char}" + ("" if play_char == c else f"  (slip: meant {c})"))
             time.sleep(char_spacing)
         time.sleep(step_gap)
     print("\n[Finished]")
@@ -404,7 +442,7 @@ def focus_roblox():
 
 # ----------------------------------------------------------------------------
 # Keyboard & console controls (Windows)
-#   - Ctrl+E hides or shows the command window, any time the app is running.
+#   - Ctrl+E closes the command window, any time the app is running.
 #   - While a song plays the physical keyboard can be turned off: a low-level
 #     hook swallows real keystrokes but lets the player's own synthetic keys
 #     through, ESC still stops playback, and the keyboard returns as soon as
@@ -412,18 +450,21 @@ def focus_roblox():
 # ----------------------------------------------------------------------------
 
 
-def toggle_console_window():
-    """Hide or show the command window. No-op when there is no console."""
+def kill_console_window():
+    """Close the command window for good (Ctrl+E). No-op without a console."""
     if os.name != "nt":
         return
-    hwnd = _kernel32.GetConsoleWindow()
-    if not hwnd:
+    if not _kernel32.GetConsoleWindow():
         return
-    if _user32.IsWindowVisible(hwnd):
-        print("[Command window hidden - press Ctrl+E to bring it back]")
-        _user32.ShowWindow(hwnd, _SW_HIDE)
-    else:
-        _user32.ShowWindow(hwnd, _SW_SHOW)
+    if _kernel32.FreeConsole():
+        # The console is gone; send prints to the void so a long song can't
+        # crash on a dead stdout.
+        try:
+            _null = open(os.devnull, "w", encoding="utf-8")
+            sys.stdout = _null
+            sys.stderr = _null
+        except Exception:
+            pass
 
 
 def start_console_hotkey():
@@ -431,7 +472,7 @@ def start_console_hotkey():
     try:
         from pynput.keyboard import GlobalHotKeys
 
-        hotkeys = GlobalHotKeys({"<ctrl>+e": toggle_console_window})
+        hotkeys = GlobalHotKeys({"<ctrl>+e": kill_console_window})
         hotkeys.daemon = True
         hotkeys.start()
     except Exception:
@@ -445,7 +486,6 @@ if os.name == "nt":
     _LLKHF_INJECTED = 0x10      # event was sent by software, not a real key
     _VK_ESCAPE, _VK_CONTROL, _VK_E = 0x1B, 0x11, 0x45
     _WM_QUIT = 0x0012
-    _SW_HIDE, _SW_SHOW = 0, 5
 
     _LRESULT = ctypes.c_ssize_t
     _HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, _wt.WPARAM, _wt.LPARAM)
@@ -508,7 +548,7 @@ class KeyboardBlocker:
                         pass
                     return 1
                 if kb.vkCode == _VK_E and _user32.GetAsyncKeyState(_VK_CONTROL) & 0x8000:
-                    toggle_console_window()
+                    kill_console_window()
                     return 1
                 if not (kb.flags & _LLKHF_INJECTED):
                     return 1
@@ -567,8 +607,8 @@ def choose_with_ui():
     """Open a small picker window with two tabs:
       - 'Files in this folder': every .mid/.midi plus sheet.txt
       - 'Paste a sheet': type/paste Virtual Piano sheet text and play it
-    Returns ('file', path, keyboard_off), ('text', text, keyboard_off),
-    or None if canceled."""
+    Returns ('file', path, keyboard_off, speed, mistakes),
+    ('text', text, keyboard_off, speed, mistakes), or None if canceled."""
     import tkinter as tk
     from tkinter import ttk
 
@@ -588,8 +628,23 @@ def choose_with_ui():
     options.pack(fill="x", padx=8)
     tk.Checkbutton(options, text="Turn off keyboard while playing",
                    variable=block_var).pack(side=tk.LEFT)
-    tk.Label(options, text="Ctrl+E hides/shows the command window",
+    tk.Label(options, text="Ctrl+E closes the command window",
              fg="#555").pack(side=tk.RIGHT)
+
+    controls = tk.Frame(root)
+    controls.pack(fill="x", padx=8, pady=(2, 6))
+    tk.Label(controls, text="Speed:").pack(side=tk.LEFT)
+    speed_scale = ttk.Scale(controls, from_=0.25, to=3.0, length=140)
+    speed_scale.set(SPEED)
+    speed_scale.pack(side=tk.LEFT)
+    speed_label = tk.Label(controls, text=f"{SPEED:.2f}x", width=7, anchor="w")
+    speed_label.pack(side=tk.LEFT)
+    speed_scale.config(command=lambda v: speed_label.config(text=f"{float(v):.2f}x"))
+    tk.Label(controls, text="Mistakes:").pack(side=tk.LEFT, padx=(16, 2))
+    mode_box = ttk.Combobox(controls, values=("Beginner", "Legit", "Pro"),
+                            state="readonly", width=9)
+    mode_box.set(MISTAKE_MODE)
+    mode_box.pack(side=tk.LEFT)
 
     # --- Tab 1: files in this folder -------------------------------------
     files_tab = ttk.Frame(notebook)
@@ -612,7 +667,8 @@ def choose_with_ui():
         def start(_event=None):
             sel = listbox.curselection()
             if sel:
-                chosen[0] = ("file", choices[sel[0]][0], bool(block_var.get()))
+                chosen[0] = ("file", choices[sel[0]][0], bool(block_var.get()),
+                             float(speed_scale.get()), mode_box.get())
             root.destroy()
 
         listbox.bind("<Double-Button-1>", start)
@@ -648,7 +704,8 @@ def choose_with_ui():
         if not content:
             paste_hint.config(text="Paste a sheet first!")
             return
-        chosen[0] = ("text", content, bool(block_var.get()))
+        chosen[0] = ("text", content, bool(block_var.get()),
+                     float(speed_scale.get()), mode_box.get())
         root.destroy()
 
     pbtns = tk.Frame(paste_tab)
@@ -679,7 +736,7 @@ def pick_file():
 
 
 def main():
-    global DRY_RUN, BLOCK_KEYBOARD
+    global DRY_RUN, BLOCK_KEYBOARD, SPEED, MISTAKE_EVERY
 
     args = sys.argv[1:]
     track = None
@@ -704,7 +761,7 @@ def main():
     if path is None and not list_tracks and not DRY_RUN:
         # Plain launch (or double-click): open the file picker UI.
         start_console_hotkey()
-        print("Tip: press Ctrl+E to hide or show this command window.")
+        print("Tip: press Ctrl+E to close this command window.")
         try:
             picked = choose_with_ui()
         except Exception as exc:
@@ -714,9 +771,11 @@ def main():
             print("Nothing selected.")
             return 0
         if isinstance(picked, str):  # auto-detect fallback returned a path
-            picked = ("file", picked, True)
-        kind, value, block_kb = picked
+            picked = ("file", picked, True, 1.0, MISTAKE_MODE)
+        kind, value, block_kb, speed, mode = picked
         BLOCK_KEYBOARD = bool(block_kb)
+        SPEED = max(0.1, float(speed) or 1.0)
+        MISTAKE_EVERY = MISTAKE_MAP.get(mode, MISTAKE_EVERY)
         try:
             if not DRY_RUN:
                 focus_roblox()
